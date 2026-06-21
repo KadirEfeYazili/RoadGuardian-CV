@@ -89,6 +89,7 @@ class TrafficTracker:
         video_path: str | None = None,
         show: bool = True,
         save_path: str | None = None,
+        annotate: bool = True,
     ):
         """Bir videodaki araclari takip eder; ekranda gosterir ve/veya kaydeder.
 
@@ -97,6 +98,8 @@ class TrafficTracker:
                 trafik videosu kullanilir.
             show: True ise canli sonuc penceresi acilir ('q' ile cikis).
             save_path: Verilirse, annotated sonuc bu yola .mp4 olarak kaydedilir.
+            annotate: False ise box+ID cizilmez (cagiranlar temiz kare uzerine
+                kendi overlay'lerini -orn. plaka hologrami- cizebilir).
         """
         source = str(video_path or settings.TRAFFIC_VIDEO_PATH)
 
@@ -117,7 +120,7 @@ class TrafficTracker:
         try:
             for result in results:
                 frame = result.orig_img
-                annotated = self.annotate_frame(frame, result)
+                annotated = self.annotate_frame(frame, result) if annotate else frame
 
                 # Cikti kaydedicisini ilk karede, gercek boyuta gore baslat.
                 if save_path and writer is None:

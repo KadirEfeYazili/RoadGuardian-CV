@@ -1,0 +1,212 @@
+"""
+RoadGuardian-AI - Plaka Takip / Onbellek Modulu
+
+Arac takibi (TrafficTracker) ile plaka okuma (PlateReader) arasindaki kopru.
+
+Kararlilik icin OYLAMA (voting) kullanir:
+- Her arac ID'si icin okunan plaka metinleri, OCR guveniyle agirlikli olarak
+  bir oy sayacinda toplanir. Ekranda EN COK OY alan metin gosterilir.
+- Bu sayede arac hareket ederken tek tek hatali okumalar gosterimi titretmez;
+  dogru plaka zamanla one cikip "kilitlenir".
+
+OCR, CPU dostu olacak sekilde kisitlanir:
+- Kare basina en fazla ``OCR_MAX_PER_FRAME`` plaka okunur.
+- Her arac en az ``OCR_REATTEMPT_INTERVAL`` kare arayla denenir.
+- "Kilitli" (kararli) plakalar daha seyrek yenilenir; OCR butcesi henuz
+  okunmamis araclara ayrilir.
+"""
+
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from core.config import settings  # noqa: E402
+from traffic_module.plate_ocr import PlateReader  # noqa: E402
+
+# Arac basina saklanan max okuma sayisi (bellek sinirlama).
+_MAX_READS = 60
+
+
+@dataclass
+class PlateRecord:
+    """Bir arac ID'sine ait plaka okuma gecmisi ve KARAKTER OYLAMASI.
+
+    Gosterilen plaka tek bir okuma degil, tum okumalarin uzlasisidir:
+      1) Okumalar UZUNLUGA gore gruplanir; toplam guveni en yuksek uzunluk secilir
+         (kisa/bozuk okumalari ve farkli uzunluk gurultusunu eler).
+      2) O uzunluktaki okumalarda HER KARAKTER KONUMU icin en cok guven alan
+         karakter secilir. Boylece 'AP05JEO' / 'ZP05JEO' gibi 1 harf farkli
+         okumalar tek dogru plakada birlesir.
+    """
+
+    reads: list[tuple[str, float]] = field(default_factory=list)  # (metin, guven)
+    plate_box: tuple[int, int, int, int] | None = None            # son plaka konumu
+    last_attempt_frame: int = -10_000
+
+    def add_vote(self, text: str, conf: float) -> None:
+        self.reads.append((text, conf))
+        if len(self.reads) > _MAX_READS:
+            self.reads.pop(0)
+
+    def _length_scores(self) -> dict[int, float]:
+        scores: dict[int, float] = defaultdict(float)
+        for t, c in self.reads:
+            scores[len(t)] += c
+        return scores
+
+    def _dominant_length(self) -> int | None:
+        scores = self._length_scores()
+        return max(scores, key=scores.get) if scores else None
+
+    @property
+    def text(self) -> str:
+        """Karakter oylamasiyla uzlasi plaka metni."""
+        dom = self._dominant_length()
+        if not dom:
+            return ""
+        chars = []
+        for i in range(dom):
+            col: dict[str, float] = defaultdict(float)
+            for t, c in self.reads:
+                if len(t) == dom:
+                    col[t[i]] += c
+            chars.append(max(col, key=col.get))
+        return "".join(chars)
+
+    @property
+    def conf(self) -> float:
+        """Uzlasi uzunlugundaki okumalarin gorulen en yuksek guveni."""
+        dom = self._dominant_length()
+        if not dom:
+            return 0.0
+        group = [c for t, c in self.reads if len(t) == dom]
+        return max(group) if group else 0.0
+
+    @property
+    def locked(self) -> bool:
+        """Baskin uzunluk yeterince ve rakibinden belirgin ustunse kararli sayilir."""
+        if len(self.reads) < 3:
+            return False
+        scores = sorted(self._length_scores().values(), reverse=True)
+        top = scores[0]
+        second = scores[1] if len(scores) > 1 else 0.0
+        return top >= settings.OCR_LOCK_SCORE and top >= settings.OCR_LOCK_RATIO * second
+
+
+@dataclass
+class PlateTracker:
+    """Arac ID -> plaka eslemesini ve oylama onbellegini yoneten sinif."""
+
+    reader: PlateReader = field(default_factory=PlateReader)
+    reattempt_interval: int = settings.OCR_REATTEMPT_INTERVAL
+    max_per_frame: int = settings.OCR_MAX_PER_FRAME
+    locked_refresh_mult: int = settings.OCR_LOCKED_REFRESH_MULT
+
+    def __post_init__(self):
+        self.records: dict[int, PlateRecord] = {}
+        self._frame_idx = 0
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _center(box) -> tuple[float, float]:
+        x1, y1, x2, y2 = box[:4]
+        return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+    @staticmethod
+    def _contains(vbox, point) -> bool:
+        x1, y1, x2, y2 = vbox
+        px, py = point
+        return x1 <= px <= x2 and y1 <= py <= y2
+
+    @staticmethod
+    def _area(box) -> float:
+        x1, y1, x2, y2 = box[:4]
+        return max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+
+    def _match_plate_to_vehicle(self, plate_box, vehicles):
+        """Bir plaka kutusunu iceren en KUCUK (en spesifik) araca esler."""
+        center = self._center(plate_box)
+        best_id = None
+        best_area = float("inf")
+        for tid, vbox in vehicles.items():
+            if self._contains(vbox, center):
+                area = self._area(vbox)
+                if area < best_area:
+                    best_area = area
+                    best_id = tid
+        return best_id
+
+    def _due_for_ocr(self, rec: PlateRecord) -> bool:
+        """Bu arac icin tekrar OCR zamani geldi mi? (kilitliyse daha seyrek)."""
+        interval = self.reattempt_interval
+        if rec.locked:
+            interval *= self.locked_refresh_mult
+        return self._frame_idx - rec.last_attempt_frame >= interval
+
+    # ------------------------------------------------------------------ #
+    def update(self, frame, vehicles: dict[int, tuple]) -> dict[int, PlateRecord]:
+        """Bir kareyi isler: plakalari tespit eder, araclara esler, oylar.
+
+        Args:
+            frame: Islenecek (temiz) BGR kare.
+            vehicles: {track_id: (x1, y1, x2, y2)} -> o karedeki araclar.
+
+        Returns:
+            Guncel {track_id: PlateRecord} onbellegi (yalnizca okunmus araclar).
+        """
+        self._frame_idx += 1
+
+        # 1) Tum kare uzerinde plakalari tespit et.
+        plate_boxes = self.reader.detect_plates(frame)
+
+        # 2) Her plakayi bir araca esle; ID basina en guvenli plaka kutusu.
+        matched: dict[int, tuple[int, int, int, int]] = {}
+        plate_conf: dict[int, float] = {}
+        for (x1, y1, x2, y2, conf) in plate_boxes:
+            tid = self._match_plate_to_vehicle((x1, y1, x2, y2), vehicles)
+            if tid is None:
+                continue
+            if conf >= plate_conf.get(tid, 0.0):
+                matched[tid] = (x1, y1, x2, y2)
+                plate_conf[tid] = conf
+
+        # 3) OCR adaylarini sec: araligi dolmus olanlar.
+        candidates = []
+        for tid, pbox in matched.items():
+            rec = self.records.get(tid)
+            if rec is None:
+                rec = PlateRecord()
+                self.records[tid] = rec
+            rec.plate_box = pbox  # Stem cizimi icin konumu daima guncelle.
+            if self._due_for_ocr(rec):
+                candidates.append((tid, pbox))
+
+        # Oncelik: once kilitli OLMAYAN (henuz kararsiz) araclar, sonra yuksek
+        # plaka guvenlileri. Boylece OCR butcesi okunmamis araclara gider.
+        candidates.sort(
+            key=lambda c: (self.records[c[0]].locked, -plate_conf.get(c[0], 0.0))
+        )
+        for tid, pbox in candidates[: self.max_per_frame]:
+            rec = self.records[tid]
+            rec.last_attempt_frame = self._frame_idx
+            reading = self.reader.read_plate_from_box(frame, pbox)
+            if reading is None:
+                continue
+            text, conf = reading
+            rec.add_vote(text, conf)
+
+        # 4) Yalnizca metni olan kayitlari dondur.
+        return {tid: r for tid, r in self.records.items() if r.text}
+
+    def get(self, track_id: int) -> PlateRecord | None:
+        rec = self.records.get(track_id)
+        return rec if (rec and rec.text) else None
+
+    def cleanup(self, active_ids: set[int]) -> None:
+        """Ekrandan cikan araclarin kayitlarini temizler (bellek icin)."""
+        for tid in list(self.records.keys()):
+            if tid not in active_ids:
+                del self.records[tid]

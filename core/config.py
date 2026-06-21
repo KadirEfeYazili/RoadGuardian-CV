@@ -23,13 +23,15 @@ class Config:
     # --- Model Yollari ---
     # Trafik modulu icin nesne tespit modeli (araclar).
     TRAFFIC_MODEL_PATH = MODELS_DIR / "yolo11n.pt"
-    # Plaka tespiti icin opsiyonel ozel model (ileride egitilecek).
-    PLATE_MODEL_PATH = MODELS_DIR / "plate_detector.pt"
+    # Plaka tespiti icin ozel YOLO modeli (license_plate sinifi).
+    PLATE_MODEL_PATH = MODELS_DIR / "license_plate_detector.pt"
     # Surucu modulu icin yuz/goz tespit modeli.
     DRIVER_MODEL_PATH = MODELS_DIR / "driver_face.pt"
 
     # --- Video / Kaynak Yollari ---
     TRAFFIC_VIDEO_PATH = DATA_DIR / "test_traffic.mp4"
+    # Plakalarin okunabildigi (araclar kameraya yakin) ANPR test videosu.
+    PLATE_VIDEO_PATH = DATA_DIR / "plate_test.mp4"
     DRIVER_VIDEO_PATH = DATA_DIR / "test_driver.mp4"
 
     # Kamera kaynaklari (0 = varsayilan webcam, RTSP/USB icin degistirilebilir).
@@ -49,6 +51,45 @@ class Config:
     # COCO veri setinde arac sayilan sinif id'leri:
     # 2: car, 3: motorcycle, 5: bus, 7: truck
     VEHICLE_CLASSES = [2, 3, 5, 7]
+
+    # --- Plaka Okuma (OCR / ANPR) Ayarlari ---
+    # Plaka tespit modelinin minimum guven skoru.
+    PLATE_CONFIDENCE_THRESHOLD = 0.3
+    # EasyOCR dil listesi ('en' Latin harf/rakamlari kapsar; TR plakalar da Latin).
+    OCR_LANGUAGES = ["en"]
+    # GPU yoksa CPU'da calisir (bu makinede CUDA yok -> False).
+    OCR_USE_GPU = False
+    # Plaka kirpintisi OCR'dan once bu kat buyutulur (kucuk plakalar icin sart).
+    OCR_UPSCALE = 4
+    # OCR sadece bir arac icin guvenilir okuma yapilana kadar denenir; ayrica
+    # ayni arac icin en az bu kadar kare gecmeden tekrar denenmez (CPU dostu).
+    OCR_REATTEMPT_INTERVAL = 8
+    # Tek bir karede en fazla kac plaka OCR'a sokulsun (CPU yukunu sinirlar).
+    OCR_MAX_PER_FRAME = 4
+    # Bir okumanin "kalici kabul" edilmesi icin gereken min OCR guveni.
+    OCR_ACCEPT_CONFIDENCE = 0.45
+    # Gecerli sayilacak min plaka karakter sayisi (gurultu metni eler).
+    # TR/AB plakalari her zaman >=5 karakter -> 4 ve altini ele (orn. "K5ZK").
+    OCR_MIN_PLATE_CHARS = 5
+    # Tek bir OCR parcasinin oya katilmasi icin gereken min guven.
+    OCR_FRAGMENT_MIN_CONF = 0.10
+
+    # --- Plaka Oylama (Kararlilik) Ayarlari ---
+    # Plaka metni kare kare degil, arac basina OYLAMA ile belirlenir: her okuma
+    # guveniyle agirlikli oy ekler, en cok oy alan metin gosterilir. Bu sayede
+    # gosterim titremez ve dogru plaka zamanla one cikar.
+    # Bir plakanin "kilitli" (kararli) sayilmasi icin gereken toplam oy skoru.
+    OCR_LOCK_SCORE = 1.6
+    # Lider metnin ikinciden bu kat fazla oyu varsa kilit kabul edilir.
+    OCR_LOCK_RATIO = 1.6
+    # Kilitli plakalar OCR butcesini bosa harcamasin diye daha seyrek yenilenir
+    # (yeniden-deneme araligi bu kat ile carpilir).
+    OCR_LOCKED_REFRESH_MULT = 6
+
+    # --- Plaka Gorunumu (Hologram) ---
+    # Hologram panelinde plakanin solundaki mavi banda yazilacak ulke kodu.
+    # Turk plakalari icin "TR"; bu UK test videosu icin "GB" yapabilirsin.
+    PLATE_COUNTRY_CODE = "TR"
 
     # --- Hiz Olcumu Ayarlari ---
     # Goruntudeki piksel mesafesini gercek dunyaya cevirmek icin kalibrasyon
