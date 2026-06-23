@@ -58,15 +58,18 @@ class Config:
 
     # --- Performans Modlari ---
     # CPU'da hiz/dogruluk dengesi. UI'dan ya da --perf ile secilir.
-    #   fast     : en hizli (kucuk model + kucuk imgsz + plaka seyrek tespit)
+    #   fast     : en hizli (kucuk model + kucuk imgsz)
     #   balanced : varsayilan denge
-    #   accurate : en dogru (buyuk imgsz + her kare plaka tespiti)
+    #   accurate : en dogru (buyuk imgsz)
+    # Plaka tespiti dengeli/dogru modda HER karede yapilir: akici videolarda
+    # hizli gecen araclari kacirmamak icin (OCR butcesi zaten "kaleci" onceligi
+    # ile sinirlanir). Yalnizca fast modda 2 karede bir tespit edilir.
     PERF_MODE = "balanced"
     PERF_PRESETS = {
         "fast":     {"track_model": "yolo11n.pt", "track_imgsz": 480,
-                     "plate_detect_interval": 3},
-        "balanced": {"track_model": "yolo11s.pt", "track_imgsz": 512,
                      "plate_detect_interval": 2},
+        "balanced": {"track_model": "yolo11s.pt", "track_imgsz": 512,
+                     "plate_detect_interval": 1},
         "accurate": {"track_model": "yolo11s.pt", "track_imgsz": 640,
                      "plate_detect_interval": 1},
     }
@@ -89,18 +92,20 @@ class Config:
     # GPU yoksa CPU'da calisir (bu makinede CUDA yok -> False).
     OCR_USE_GPU = False
     # Plaka kirpintisi OCR'dan once bu HEDEF GENISLIGE buyutulur/kuculur.
-    # (Eskiden sabit 4x; cok buyuk plakalarda OCR'i yavaslatiyordu.) ~200px
-    # EasyOCR icin yeterli ve hizli.
+    # ~200px EasyOCR icin hem yeterince keskin hem de hizlidir.
     OCR_TARGET_WIDTH = 200
-    # Eski sabit-kat buyutme (artik OCR_TARGET_WIDTH kullanilir; geriye uyum icin).
-    OCR_UPSCALE = 2
-    # OCR sadece bir arac icin guvenilir okuma yapilana kadar denenir; ayrica
-    # ayni arac icin en az bu kadar kare gecmeden tekrar denenmez (CPU dostu).
+    # Ayni arac icin en az bu kadar kare gecmeden OCR tekrar denenmez (CPU dostu).
+    # Not: "kareden cikmaya yakin" (acil) araclar bu araligi atlayip her karede
+    # okunur -> cikmadan once mumkun oldugunca cok oy toplanir.
     OCR_REATTEMPT_INTERVAL = 6
-    # Tek bir karede en fazla kac plaka OCR'a sokulsun (CPU yukunu sinirlar).
+    # Tek bir karede en fazla kac plaka OCR'a sokulsun. "Kaleci" onceligiyle
+    # bunlar daima kareden CIKMAYA EN YAKIN araclardir (2-3 arac yan yana ise
+    # hepsi okunur).
     OCR_MAX_PER_FRAME = 3
-    # Bir okumanin "kalici kabul" edilmesi icin gereken min OCR guveni.
-    OCR_ACCEPT_CONFIDENCE = 0.45
+    # Bir aracin "acil" (kareden cikmak uzere) sayilmasi icin tahmini cikis
+    # suresi esigi (kare cinsinden). Bu surenin altindaki araclar her karede,
+    # araligi beklemeden okunur.
+    OCR_URGENT_FRAMES = 18
     # Gecerli sayilacak min plaka karakter sayisi (gurultu metni eler).
     # TR/AB plakalari her zaman >=5 karakter -> 4 ve altini ele (orn. "K5ZK").
     OCR_MIN_PLATE_CHARS = 5
@@ -109,25 +114,21 @@ class Config:
 
     # --- Plaka Dogrulama (Validation) Ayarlari ---
     # Plaka EKRANDA gosterilmeden once en az bu kadar okuma (oy) birikmeli.
-    # Bu sayede ilk hatali okuma (orn. "34..." yerine "02...") ekranda
-    # gosterilmez; once oylama bir uzlasiya ulasir. (>=2 onerilir.)
-    OCR_MIN_VOTES_TO_SHOW = 2
+    # 1 = ilk okumada hemen goster (dusuk gecikme; bicim duzeltmesi ilk okumayi
+    # da temizler). Plaka "kilitlenince" donderilir ve bir daha degismez.
+    OCR_MIN_VOTES_TO_SHOW = 1
     # Plaka metni bilinen bir ulke BICIMINE uyuyorsa oyu bu kat ile carpilir.
-    # Boylece bicimsel olarak gecerli (dogru) okumalar gecersizleri yener ->
-    # "34KLE88" gibi gecerli okuma, "02..." gibi bozuk okumayi hizla geride birakir.
+    # Boylece bicimsel olarak gecerli okumalar gecersizleri yener.
     OCR_VALID_FORMAT_BONUS = 2.0
 
-    # --- Plaka Oylama (Kararlilik) Ayarlari ---
-    # Plaka metni kare kare degil, arac basina OYLAMA ile belirlenir: her okuma
-    # guveniyle agirlikli oy ekler, en cok oy alan metin gosterilir. Bu sayede
-    # gosterim titremez ve dogru plaka zamanla one cikar.
-    # Bir plakanin "kilitli" (kararli) sayilmasi icin gereken toplam oy skoru.
+    # --- Plaka Oylama / Kilit (Kararlilik) Ayarlari ---
+    # Plaka metni kare kare degil, arac basina agirlikli OYLAMA ile belirlenir.
+    # Yeterli ve tutarli oy birikince plaka KILITLENIR: o andaki uzlasi metni
+    # donderilir, OCR durur (butce diger araclara kalir) ve metin DEGISMEZ.
+    # Kilit icin gereken toplam (agirlikli) oy skoru.
     OCR_LOCK_SCORE = 1.6
     # Lider metnin ikinciden bu kat fazla oyu varsa kilit kabul edilir.
     OCR_LOCK_RATIO = 1.6
-    # Kilitli plakalar OCR butcesini bosa harcamasin diye daha seyrek yenilenir
-    # (yeniden-deneme araligi bu kat ile carpilir).
-    OCR_LOCKED_REFRESH_MULT = 6
 
     # --- Plaka Gorunumu (Hologram) ---
     # Hologram panelinde plakanin solundaki mavi banda yazilacak ulke kodu.

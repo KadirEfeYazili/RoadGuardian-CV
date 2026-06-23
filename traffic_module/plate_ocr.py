@@ -30,8 +30,11 @@ from core.config import settings  # noqa: E402
 # OCR sonucundan plaka disi karakterleri (bosluk, tire, nokta vb.) ayikla.
 _NON_ALNUM = re.compile(r"[^A-Z0-9]")
 
-# OCR'in rakam/harf karistirmalari (belirli konumda rakam beklerken).
+# OCR'in rakam/harf karistirmalari. Iki yon:
+#   _L2D: rakam BEKLENEN konumda harfi rakama cevirir (O->0, I->1...).
+#   _D2L: harf BEKLENEN konumda rakami harfe cevirir (0->O, 1->I...).
 _L2D = str.maketrans("OISZBG", "015286")
+_D2L = str.maketrans("015286", "OISZBG")
 
 # --------------------------------------------------------------------------- #
 # Cok-ulkeli plaka BICIM tanima
@@ -70,6 +73,98 @@ _COUNTRY_FORMATS = [
 
 # Bilinen ulke kodlari (UI/dogrulama icin).
 KNOWN_COUNTRY_CODES = [c for c, *_ in _COUNTRY_FORMATS]
+
+# Sabit yapili (tek, belirsizlik icermeyen kalip) bicimler icin konum maskesi:
+#   'D' -> o konumda RAKAM olmali, 'L' -> HARF olmali.
+# Bu maskeler OCR harf/rakam karisikligini KESIN konumlarda duzeltmeye yarar
+# (orn. GB "LP05JE0" -> son konum harf olmali -> "LP05JEO"). Degisken yapili
+# bicimler (TR, RU...) asagida ayrica, yalnizca kesin konumlarda ele alinir.
+_FORMAT_MASKS = {
+    "GB": "LLDDLLL",
+    "UA": "LLDDDDLL",
+    "ES": "DDDDLLL",
+    "BE": "DLLLDDD",
+    "GR": "LLLDDDD",
+    "FR": "LLDDDLL",
+    "IT": "LLDDDLL",
+}
+
+
+# Sabit maskeli ulkelerin ozgunlugu (yapisal yakin-eslesmede esitlik bozucu).
+_MASK_SPEC = {code: spec for code, _rx, spec, _pop in _COUNTRY_FORMATS}
+
+
+def _apply_mask(t: str, mask: str) -> str:
+    """Metni konum maskesine gore duzeltir ('D'=rakam, 'L'=harf konumu)."""
+    return "".join(
+        ch.translate(_L2D) if m == "D" else ch.translate(_D2L)
+        for ch, m in zip(t, mask)
+    )
+
+
+def _structure(t: str) -> str:
+    """Metnin yapisini 'D'(rakam)/'L'(harf) dizisi olarak verir."""
+    return "".join("D" if ch.isdigit() else "L" for ch in t)
+
+
+def _nearest_fixed_mask(t: str, max_mismatch: int = 1) -> str | None:
+    """Metne yapisal olarak EN YAKIN sabit maskeyi bulur (<= max_mismatch fark).
+
+    OCR bir konumda harf/rakam sinifini bozdugunda (orn. GB "LP05JE0": son konum
+    harf olmali) regex hic eslesmez. Bu durumda tek-iki konum farkla en yakin
+    sabit kalip yakalanip o konum duzeltilir. Esitlikte ozgun (daha ayirt edici)
+    bicim tercih edilir.
+    """
+    st = _structure(t)
+    best = None  # (mismatch, -ozgunluk, mask)
+    for code, mask in _FORMAT_MASKS.items():
+        if len(mask) != len(t):
+            continue
+        mism = sum(a != b for a, b in zip(st, mask))
+        if mism <= max_mismatch:
+            cand = (mism, -_MASK_SPEC.get(code, 0.0), mask)
+            if best is None or cand < best:
+                best = cand
+    return best[2] if best else None
+
+
+def correct_by_format(plate_text: str) -> str:
+    """Plaka metnini, uydugu ulke BICIMINE gore karakter bazinda duzeltir.
+
+    OCR'in tipik harf/rakam karisikliklarini (O<->0, I<->1, S<->5, B<->8...)
+    yalnizca yapinin KESIN oldugu konumlarda giderir. Boylece "her plakada 1-2
+    yanlis karakter" sorunu, plaka formati bilindiginde belirgin azalir.
+    Hicbir bicime uymuyorsa metin oldugu gibi doner (asiri duzeltme yapilmaz).
+    """
+    base = _NON_ALNUM.sub("", (plate_text or "").upper())
+    if len(base) < 5:
+        return base
+
+    hit = _scan_formats(base)
+    code = hit[1] if hit else None
+
+    # 1) Ayirt edici, sabit yapili bir bicim TAM eslestiyse maskesini uygula.
+    mask = _FORMAT_MASKS.get(code)
+    if mask and len(mask) == len(base):
+        return _apply_mask(base, mask)
+    if code == "RU" and len(base) in (8, 9):
+        # L DDD LL D{2,3}: ilk 6 konum sabit, kalani rakam.
+        return _apply_mask(base, "LDDDLL" + "D" * (len(base) - 6))
+    if code == "TR" and len(base) >= 5:
+        # TR daima 2 rakamla baslar ve >=2 rakamla biter (orta grup degisken).
+        chars = list(base)
+        chars[0] = chars[0].translate(_L2D)
+        chars[1] = chars[1].translate(_L2D)
+        chars[-1] = chars[-1].translate(_L2D)
+        chars[-2] = chars[-2].translate(_L2D)
+        return "".join(chars)
+
+    # 2) Tam eslesme yok ya da yalnizca genel (US/DE...) eslesti: tek konum sinif
+    #    hatasini, en yakin sabit maskeyle duzeltmeyi dene ("LP05JE0" -> "LP05JEO").
+    #    Maske yalnizca KARISTIRILABILIR karakterleri (O<->0, S<->5...) cevirir,
+    #    bu yuzden gecerli plakalari bozmaz.
+    near = _nearest_fixed_mask(base)
+    return _apply_mask(base, near) if near else base
 
 
 def _tolerant_variants(t: str):

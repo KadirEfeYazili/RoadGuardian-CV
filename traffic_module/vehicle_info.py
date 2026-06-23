@@ -123,7 +123,10 @@ def _classify_bgr(bgr) -> str:
 
     # --- Akromatik mi? (renksiz: siyah/gri/gumus/beyaz) ---
     # Lab kromasi dusukse renk yok demektir; HSV doygunlugundan daha kararli.
-    if chroma < 20:
+    # Ek olarak: cok parlak yuzeyler (beyaz/gumus) yansima nedeniyle hafif renk
+    # tonu kapar; yuksek parlaklikta orta kromayi da akromatik say (yanlis "Sari"
+    # / "Mavi" gibi sonuclari onler).
+    if chroma < 20 or (val > 170 and chroma < 32):
         if L < 70:
             return "Siyah"
         if L < 140:

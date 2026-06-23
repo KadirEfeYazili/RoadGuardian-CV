@@ -3,17 +3,21 @@ RoadGuardian-CV - Plaka Takip / Onbellek Modulu
 
 Arac takibi (TrafficTracker) ile plaka okuma (PlateReader) arasindaki kopru.
 
-Kararlilik icin OYLAMA (voting) kullanir:
-- Her arac ID'si icin okunan plaka metinleri, OCR guveniyle agirlikli olarak
-  bir oy sayacinda toplanir. Ekranda EN COK OY alan metin gosterilir.
-- Bu sayede arac hareket ederken tek tek hatali okumalar gosterimi titretmez;
-  dogru plaka zamanla one cikip "kilitlenir".
+Iki temel fikir uzerine kuruludur:
 
-OCR, CPU dostu olacak sekilde kisitlanir:
-- Kare basina en fazla ``OCR_MAX_PER_FRAME`` plaka okunur.
-- Her arac en az ``OCR_REATTEMPT_INTERVAL`` kare arayla denenir.
-- "Kilitli" (kararli) plakalar daha seyrek yenilenir; OCR butcesi henuz
-  okunmamis araclara ayrilir.
+1) "KALECI" ONCELIGI (goalkeeper scheduling)
+   Araclar bir akista kareye girip cikar; bir plaka yalnizca arac kareden
+   CIKANA KADAR okunabilir. Bu yuzden sinirli OCR butcesi her zaman kareden
+   CIKMAYA EN YAKIN araclara ayrilir (bir kalecinin daima kaleye en yakin topa
+   bakmasi gibi). Cikis yakinligi, aracin HIZINDAN tahmini "cikisa kalan kare"
+   ile olculur. Yan yana birden cok arac cikmak uzereyse hepsi okunur.
+
+2) AGIRLIKLI OYLAMA + KILIT (voting & lock)
+   Her okuma, OCR guveni VE plaka bicimi gecerliligi ile agirliklanir; her
+   karakter konumu icin en cok agirlik alan karakter secilir. Plaka okunur
+   okunmaz gosterilir (dusuk gecikme); yeterli/tutarli oy birikince KILITLENIR:
+   metin bicime gore son kez duzeltilir, DONDURULUR (bir daha degismez) ve o
+   arac icin OCR durur (butce diger araclara kalir).
 """
 
 import sys
@@ -24,38 +28,40 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from core.config import settings  # noqa: E402
-from traffic_module.plate_ocr import PlateReader, plate_format_score  # noqa: E402
+from traffic_module.plate_ocr import (  # noqa: E402
+    PlateReader,
+    correct_by_format,
+    plate_format_score,
+)
 
 # Arac basina saklanan max okuma sayisi (bellek sinirlama).
-_MAX_READS = 60
+_MAX_READS = 40
+# Bir aracin "hareketli" sayilmasi icin min hiz (px/kare); altinda titreme.
+_MIN_SPEED = 0.5
 
 
 @dataclass
 class PlateRecord:
-    """Bir arac ID'sine ait plaka okuma gecmisi ve KARAKTER OYLAMASI.
+    """Bir arac ID'sine ait plaka okuma gecmisi, oylama ve KILIT durumu.
 
-    Gosterilen plaka tek bir okuma degil, tum okumalarin uzlasisidir:
-      1) Her okuma, ham OCR guveni VE bicim gecerliligi ile AGIRLIKLANIR:
-         bilinen bir ulke plaka bicimine uyan okumalar (orn. "34KLE88") daha
-         fazla oy alir; bicimsiz gurultu (orn. "02XQ") geride kalir.
-      2) Okumalar UZUNLUGA gore gruplanir; toplam agirligi en yuksek uzunluk
-         secilir (farkli uzunluk gurultusunu eler).
-      3) O uzunluktaki okumalarda HER KARAKTER KONUMU icin en cok agirlik alan
-         karakter secilir. Boylece 'AP05JEO' / 'ZP05JEO' gibi 1 harf farkli
-         okumalar tek dogru plakada birlesir.
+    Gosterilen plaka tek bir okuma degil, agirlikli oylamanin uzlasisidir:
+      1) Her okuma ``guven * (1 + BONUS * bicim_skoru)`` ile agirliklanir;
+         gecerli bicimli okumalar (orn. "34KLE88") gurultuyu yener.
+      2) Okumalar uzunluga gore gruplanir; toplam agirligi en yuksek uzunluk
+         secilir.
+      3) O uzunlukta her karakter konumu icin en cok agirlik alan karakter
+         secilir ve sonuc plaka bicimine gore son kez duzeltilir.
 
-    DOGRULAMA: Plaka, ancak en az ``OCR_MIN_VOTES_TO_SHOW`` oy biriktikten ve
-    makul bir uzunluga ulastiktan SONRA "gosterime hazir" (``ready``) sayilir.
-    Bu, ilk hatali okumanin (gecici "02...") ekranda gosterilmesini engeller.
+    Plaka ``locked`` olunca ``frozen`` doldurulur ve ``text`` artik sabit kalir.
     """
 
     # (metin, ham_guven, agirlik) -> agirlik = guven * bicim bonusu
     reads: list[tuple[str, float, float]] = field(default_factory=list)
-    plate_box: tuple[int, int, int, int] | None = None            # son plaka konumu
+    plate_box: tuple[int, int, int, int] | None = None   # son plaka konumu
     last_attempt_frame: int = -10_000
+    frozen: str | None = None                            # kilit sonrasi sabit metin
 
     def add_vote(self, text: str, conf: float) -> None:
-        # Bicimsel olarak gecerli okumalari odullendir (dogrulama agirligi).
         weight = conf * (1.0 + settings.OCR_VALID_FORMAT_BONUS * plate_format_score(text))
         self.reads.append((text, conf, weight))
         if len(self.reads) > _MAX_READS:
@@ -71,9 +77,8 @@ class PlateRecord:
         scores = self._length_scores()
         return max(scores, key=scores.get) if scores else None
 
-    @property
-    def text(self) -> str:
-        """Agirlikli karakter oylamasiyla uzlasi plaka metni."""
+    def _consensus(self) -> str:
+        """Agirlikli karakter oylamasiyla ham uzlasi metni (duzeltme oncesi)."""
         dom = self._dominant_length()
         if not dom:
             return ""
@@ -85,6 +90,13 @@ class PlateRecord:
                     col[t[i]] += w
             chars.append(max(col, key=col.get))
         return "".join(chars)
+
+    @property
+    def text(self) -> str:
+        """Gosterilecek plaka: kilitliyse sabit, degilse bicime gore duzeltilmis."""
+        if self.frozen is not None:
+            return self.frozen
+        return correct_by_format(self._consensus())
 
     @property
     def conf(self) -> float:
@@ -105,19 +117,21 @@ class PlateRecord:
 
     @property
     def ready(self) -> bool:
-        """Plaka ekranda gosterilmeye hazir mi? (dogrulama kapisi).
-
-        En az ``OCR_MIN_VOTES_TO_SHOW`` oy birikmeli ve uzlasi metni makul
-        uzunlukta olmali. Boylece gecici/ilk hatali okumalar gosterilmez.
-        """
+        """Plaka ekranda gosterilmeye hazir mi? (en az N oy + makul uzunluk)."""
+        if self.frozen is not None:
+            return True
         return (
             self.votes >= settings.OCR_MIN_VOTES_TO_SHOW
-            and len(self.text) >= settings.OCR_MIN_PLATE_CHARS
+            and len(self._consensus()) >= settings.OCR_MIN_PLATE_CHARS
         )
 
     @property
     def locked(self) -> bool:
-        """Baskin uzunluk yeterince ve rakibinden belirgin ustunse kararli sayilir."""
+        """Kilitli mi? (kalici metin donduruldu)."""
+        return self.frozen is not None
+
+    def _lock_ready(self) -> bool:
+        """Kilit sarti: baskin uzunluk yeterince ve rakibinden belirgin ustun."""
         if len(self.reads) < 3:
             return False
         scores = sorted(self._length_scores().values(), reverse=True)
@@ -125,22 +139,31 @@ class PlateRecord:
         second = scores[1] if len(scores) > 1 else 0.0
         return top >= settings.OCR_LOCK_SCORE and top >= settings.OCR_LOCK_RATIO * second
 
+    def commit(self) -> None:
+        """Kilit sarti saglandiysa metni dondur (bir daha degismez)."""
+        if self.frozen is None and self._lock_ready():
+            text = correct_by_format(self._consensus())
+            if len(text) >= settings.OCR_MIN_PLATE_CHARS:
+                self.frozen = text
+
 
 @dataclass
 class PlateTracker:
-    """Arac ID -> plaka eslemesini ve oylama onbellegini yoneten sinif."""
+    """Arac ID -> plaka eslemesini, oylamayi ve "kaleci" OCR onceligini yonetir."""
 
     reader: PlateReader = field(default_factory=PlateReader)
     reattempt_interval: int = settings.OCR_REATTEMPT_INTERVAL
     max_per_frame: int = settings.OCR_MAX_PER_FRAME
-    locked_refresh_mult: int = settings.OCR_LOCKED_REFRESH_MULT
     detect_interval: int = settings.PLATE_DETECT_INTERVAL
+    urgent_frames: float = settings.OCR_URGENT_FRAMES
 
     def __post_init__(self):
         self.records: dict[int, PlateRecord] = {}
+        self._centers: dict[int, tuple[float, float]] = {}   # son merkez
+        self._vel: dict[int, tuple[float, float]] = {}       # EMA hiz (px/kare)
         self._frame_idx = 0
 
-    # ------------------------------------------------------------------ #
+    # --- geometri yardimcilari ------------------------------------------ #
     @staticmethod
     def _center(box) -> tuple[float, float]:
         x1, y1, x2, y2 = box[:4]
@@ -160,49 +183,77 @@ class PlateTracker:
     def _match_plate_to_vehicle(self, plate_box, vehicles):
         """Bir plaka kutusunu iceren en KUCUK (en spesifik) araca esler."""
         center = self._center(plate_box)
-        best_id = None
-        best_area = float("inf")
+        best_id, best_area = None, float("inf")
         for tid, vbox in vehicles.items():
             if self._contains(vbox, center):
                 area = self._area(vbox)
                 if area < best_area:
-                    best_area = area
-                    best_id = tid
+                    best_area, best_id = area, tid
         return best_id
 
+    # --- "kaleci" onceligi: cikisa kalan sure --------------------------- #
+    def _update_motion(self, vehicles: dict[int, tuple]) -> None:
+        """Her arac icin merkez + EMA hizini (px/kare) gunceller."""
+        for tid, box in vehicles.items():
+            cx, cy = self._center(box)
+            prev = self._centers.get(tid)
+            if prev is not None:
+                inst = (cx - prev[0], cy - prev[1])
+                old = self._vel.get(tid, inst)
+                self._vel[tid] = (
+                    0.6 * old[0] + 0.4 * inst[0],
+                    0.6 * old[1] + 0.4 * inst[1],
+                )
+            self._centers[tid] = (cx, cy)
+
+    def _frames_to_exit(self, tid: int, box, w: int, h: int) -> float:
+        """Aracin HAREKET YONUNDE kareden cikmasina kalan tahmini kare sayisi.
+
+        Hareketin onde gelen kenari (gidis yonundeki kenar) ile o yondeki kare
+        sinirinin arasindaki mesafe / hiz. Durağan araclar icin sonsuz (acil degil).
+        """
+        vx, vy = self._vel.get(tid, (0.0, 0.0))
+        x1, y1, x2, y2 = box
+        tte = float("inf")
+        if vx > _MIN_SPEED:
+            tte = min(tte, (w - x2) / vx)
+        elif vx < -_MIN_SPEED:
+            tte = min(tte, x1 / (-vx))
+        if vy > _MIN_SPEED:
+            tte = min(tte, (h - y2) / vy)
+        elif vy < -_MIN_SPEED:
+            tte = min(tte, y1 / (-vy))
+        return max(0.0, tte)
+
     def _due_for_ocr(self, rec: PlateRecord) -> bool:
-        """Bu arac icin tekrar OCR zamani geldi mi? (kilitliyse daha seyrek)."""
-        interval = self.reattempt_interval
-        if rec.locked:
-            interval *= self.locked_refresh_mult
-        return self._frame_idx - rec.last_attempt_frame >= interval
+        """Yeniden-deneme araligi doldu mu? (acil araclar bunu atlar)."""
+        return self._frame_idx - rec.last_attempt_frame >= self.reattempt_interval
 
     # ------------------------------------------------------------------ #
     def update(self, frame, vehicles: dict[int, tuple]) -> dict[int, PlateRecord]:
-        """Bir kareyi isler: plakalari tespit eder, araclara esler, oylar.
+        """Bir kareyi isler: hareketi gunceller, plakalari okur (kaleci onceligi).
 
         Args:
             frame: Islenecek (temiz) BGR kare.
             vehicles: {track_id: (x1, y1, x2, y2)} -> o karedeki araclar.
 
         Returns:
-            Guncel {track_id: PlateRecord} onbellegi (yalnizca okunmus araclar).
+            Gosterime hazir {track_id: PlateRecord} kayitlari.
         """
         self._frame_idx += 1
+        h, w = frame.shape[:2]
 
-        # CPU tasarrufu: plaka tespiti + OCR yalnizca her ``detect_interval``
-        # karede bir yapilir. Aradaki karelerde mevcut (hazir) kayitlar aynen
-        # cizilmeye devam eder; plaka konumu son tespitten korunur.
+        # Hareket/hiz HER karede guncellenir (cikis tahmini icin), tespit atlasa bile.
+        self._update_motion(vehicles)
+
+        # CPU tasarrufu (yalnizca fast modda): plaka tespiti N karede bir.
         if self.detect_interval > 1 and (self._frame_idx % self.detect_interval) != 0:
             return {tid: r for tid, r in self.records.items() if r.ready}
 
-        # 1) Tum kare uzerinde plakalari tespit et.
-        plate_boxes = self.reader.detect_plates(frame)
-
-        # 2) Her plakayi bir araca esle; ID basina en guvenli plaka kutusu.
+        # 1) Plakalari tespit et ve her birini bir araca esle (ID basina en guvenli).
         matched: dict[int, tuple[int, int, int, int]] = {}
         plate_conf: dict[int, float] = {}
-        for (x1, y1, x2, y2, conf) in plate_boxes:
+        for (x1, y1, x2, y2, conf) in self.reader.detect_plates(frame):
             tid = self._match_plate_to_vehicle((x1, y1, x2, y2), vehicles)
             if tid is None:
                 continue
@@ -210,33 +261,36 @@ class PlateTracker:
                 matched[tid] = (x1, y1, x2, y2)
                 plate_conf[tid] = conf
 
-        # 3) OCR adaylarini sec: araligi dolmus olanlar.
-        candidates = []
+        # 2) Aday sec: kilitli OLMAYAN ve (araligi dolmus VEYA cikmak uzere) araclar.
+        candidates = []  # (tte, votes, -plate_conf, tid, pbox)
         for tid, pbox in matched.items():
             rec = self.records.get(tid)
             if rec is None:
                 rec = PlateRecord()
                 self.records[tid] = rec
-            rec.plate_box = pbox  # Stem cizimi icin konumu daima guncelle.
-            if self._due_for_ocr(rec):
-                candidates.append((tid, pbox))
+            rec.plate_box = pbox  # huzme cizimi icin konumu daima guncelle
+            if rec.locked:
+                continue  # kilitli: metni sabit, OCR butcesini bosa harcama
+            tte = self._frames_to_exit(tid, vehicles[tid], w, h)
+            urgent = tte < self.urgent_frames
+            if urgent or self._due_for_ocr(rec):
+                candidates.append((tte, rec.votes, -plate_conf.get(tid, 0.0), tid, pbox))
 
-        # Oncelik: once kilitli OLMAYAN (henuz kararsiz) araclar, sonra yuksek
-        # plaka guvenlileri. Boylece OCR butcesi okunmamis araclara gider.
-        candidates.sort(
-            key=lambda c: (self.records[c[0]].locked, -plate_conf.get(c[0], 0.0))
-        )
-        for tid, pbox in candidates[: self.max_per_frame]:
+        # KALECI ONCELIGI: kareden CIKMAYA EN YAKIN (en kucuk tte) once; esitlikte
+        # az okunmus (dusuk oy) ve yuksek plaka guvenli olan one gecer.
+        candidates.sort(key=lambda c: c[:3])
+
+        # 3) Butce kadarini oku, oy ekle, kilit sartini kontrol et.
+        for _tte, _v, _nc, tid, pbox in candidates[: self.max_per_frame]:
             rec = self.records[tid]
             rec.last_attempt_frame = self._frame_idx
             reading = self.reader.read_plate_from_box(frame, pbox)
             if reading is None:
                 continue
-            text, conf = reading
-            rec.add_vote(text, conf)
+            rec.add_vote(*reading)
+            rec.commit()  # yeterince kararliysa metni dondur
 
-        # 4) Yalnizca DOGRULANMIS (gosterime hazir) kayitlari dondur.
-        #    ready: yeterli oy + makul uzunluk -> ilk hatali okuma gosterilmez.
+        # 4) Yalnizca gosterime hazir kayitlari dondur.
         return {tid: r for tid, r in self.records.items() if r.ready}
 
     def get(self, track_id: int) -> PlateRecord | None:
@@ -244,7 +298,9 @@ class PlateTracker:
         return rec if (rec and rec.ready) else None
 
     def cleanup(self, active_ids: set[int]) -> None:
-        """Ekrandan cikan araclarin kayitlarini temizler (bellek icin)."""
-        for tid in list(self.records.keys()):
-            if tid not in active_ids:
-                del self.records[tid]
+        """Ekrandan cikan araclarin kayit/hareket verilerini temizler (bellek)."""
+        for tid in [t for t in self.records if t not in active_ids]:
+            del self.records[tid]
+        for tid in [t for t in self._centers if t not in active_ids]:
+            del self._centers[tid]
+            self._vel.pop(tid, None)
