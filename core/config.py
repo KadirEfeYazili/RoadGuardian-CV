@@ -33,8 +33,15 @@ class Config:
     TRAFFIC_MODEL_PATH = MODELS_DIR / "yolo11s.pt"
     # Plaka tespiti icin ozel YOLO modeli (license_plate sinifi).
     PLATE_MODEL_PATH = MODELS_DIR / "license_plate_detector.pt"
-    # Surucu modulu icin yuz/goz tespit modeli.
-    DRIVER_MODEL_PATH = MODELS_DIR / "driver_face.pt"
+    # Surucu modulu yuz landmark modeli (MediaPipe Tasks "FaceLandmarker").
+    # 478 landmark (iris dahil) -> goz/agiz/kafa sinyalleri buradan hesaplanir.
+    # .task dosyasi Google'in modelleri olup bir kez indirilir (driver_module
+    # ilk calistiginda yoksa otomatik indirir).
+    DRIVER_MODEL_PATH = MODELS_DIR / "face_landmarker.task"
+    DRIVER_MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+        "face_landmarker/float16/1/face_landmarker.task"
+    )
 
     # --- Video / Kaynak Yollari ---
     TRAFFIC_VIDEO_PATH = DATA_DIR / "test_traffic.mp4"
@@ -153,9 +160,37 @@ class Config:
     PIXELS_PER_METER = 8.0
     SPEED_LIMIT_KMH = 50
 
-    # --- Surucu Modulu (Uyku/Dikkat) Ayarlari ---
-    EYE_AR_THRESHOLD = 0.25      # Goz kapanma orani esigi (EAR)
-    DROWSINESS_FRAMES = 20       # Bu kadar kare boyunca goz kapali ise uyari
+    # --- Sürücü Modülü (Uyku/Dikkat) Ayarları ---
+    # Sürücü içi kamera kaynağı (webcam indeksi). run_driver.py --cam ile ezilebilir.
+    DRIVER_CAM_SOURCE = 0
+
+    # Göz Açıklık Oranı (EAR - Eye Aspect Ratio): göz dikey/yatay mesafe oranı.
+    # Göz kapandıkça düşer. Bu eşiğin ALTINDA ise göz "kapalı" sayılır.
+    EYE_AR_THRESHOLD = 0.25
+    # Göz bu kadar ARDIŞIK kare kapalı kalırsa "microsleep" -> ALARM tetiklenir
+    # (~30 FPS'te 20 kare ≈ 0.7 sn göz kapalı).
+    DROWSINESS_FRAMES = 20
+
+    # PERCLOS: son penceredeki gözün kapalı kaldığı kare oranı (yorgunluğun
+    # en güvenilir göstergesi). Pencere uzunluğu (saniye) ve "yorgun" eşik oranı.
+    PERCLOS_WINDOW_SEC = 30.0
+    PERCLOS_DROWSY_RATIO = 0.40   # Karelerin %40'ında göz kapalıysa DROWSY uyarısı
+
+    # Ağız Açıklık Oranı (MAR - Mouth Aspect Ratio): esneme tespiti.
+    # Bu eşiğin ÜSTÜNDE ve yeterince uzun sürerse bir esneme sayılır.
+    MAR_YAWN_THRESHOLD = 0.6
+    YAWN_MIN_FRAMES = 12          # Esnemenin geçerli sayılması için min ardışık kare
+
+    # Kafa eğikliği (pitch, derece): baş öne düşerse (uyuklama) artan değer.
+    # Bu açının üstünde ve yeterince uzun sürerse "baş düşmesi" (nod) sayılır.
+    HEAD_PITCH_THRESHOLD = 18.0
+    NOD_MIN_FRAMES = 12
+
+    # ALARM durumunda sesli uyarı (Windows'ta yerleşik winsound.Beep ile;
+    # winsound yoksa sessizce atlanır). run_driver.py --no-sound ile kapatılır.
+    DRIVER_ALERT_SOUND = True
+    DRIVER_ALERT_BEEP_HZ = 1100   # Beep frekansı (Hz)
+    DRIVER_ALERT_BEEP_MS = 600    # Beep süresi (ms)
 
     # --- API Ayarlari ---
     API_HOST = "0.0.0.0"
