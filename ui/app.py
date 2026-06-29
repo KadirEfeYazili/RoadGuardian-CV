@@ -33,6 +33,7 @@ from traffic_module.plate_ocr import KNOWN_COUNTRY_CODES  # noqa: E402
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "output"
 RUN_PY = ROOT / "run.py"
+RUN_DRIVER_PY = ROOT / "run_driver.py"
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
 # Ulke kodu -> okunabilir ad (panelde gostermek icin).
@@ -50,8 +51,8 @@ class RoadGuardianUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("RoadGuardian-CV | Video Kontrol Paneli")
-        root.geometry("560x520")
-        root.minsize(520, 480)
+        root.geometry("560x600")
+        root.minsize(520, 560)
 
         self._procs: list[subprocess.Popen] = []
         self.selected_video: Path | None = None
@@ -71,9 +72,22 @@ class RoadGuardianUI:
         )
         title.pack(anchor="w", padx=12, pady=(12, 0))
         ttk.Label(
-            self.root, text="Plaka Tanima + Hologram | Video sec ve baslat",
+            self.root, text="Plaka Tanima + Hologram | Surucu Uyku Sensoru",
             foreground="#555",
         ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        # --- 0) Modul secimi (Trafik / Surucu) ---
+        frame_mod = ttk.LabelFrame(self.root, text="0) Modul")
+        frame_mod.pack(fill="x", **pad)
+        self.module_var = tk.StringVar(value="traffic")
+        ttk.Radiobutton(
+            frame_mod, text="Trafik (plaka + hologram)", value="traffic",
+            variable=self.module_var, command=self._on_module_change,
+        ).pack(side="left", padx=8, pady=6)
+        ttk.Radiobutton(
+            frame_mod, text="Surucu (uyku sensoru)", value="driver",
+            variable=self.module_var, command=self._on_module_change,
+        ).pack(side="left", padx=8, pady=6)
 
         # --- 1) Video listesi (data/) ---
         frame_list = ttk.LabelFrame(self.root, text="1) data/ icindeki videolar")
@@ -138,6 +152,21 @@ class RoadGuardianUI:
         )
         self.perf_combo.pack(side="left", padx=8)
 
+        # Webcam satiri (yalnizca Surucu modulunde anlamli).
+        row3 = ttk.Frame(frame_opt)
+        row3.pack(fill="x", padx=8, pady=6)
+        self.webcam_var = tk.BooleanVar(value=True)
+        self.webcam_chk = ttk.Checkbutton(
+            row3, text="Webcam kullan (surucu) - kamera indeksi:",
+            variable=self.webcam_var, command=self._on_module_change,
+        )
+        self.webcam_chk.pack(side="left")
+        self.cam_index_var = tk.StringVar(value=str(settings.DRIVER_CAM_SOURCE))
+        self.cam_spin = ttk.Spinbox(
+            row3, from_=0, to=8, width=4, textvariable=self.cam_index_var,
+        )
+        self.cam_spin.pack(side="left", padx=8)
+
         self.save_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frame_opt, text="Sonucu output/ klasorune .mp4 kaydet",
@@ -145,16 +174,21 @@ class RoadGuardianUI:
         ).pack(anchor="w", padx=8, pady=2)
 
         self.card_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
+        self.card_chk = ttk.Checkbutton(
             frame_opt, text="Arac tip/renk bilgi kartini goster",
             variable=self.card_var,
-        ).pack(anchor="w", padx=8, pady=2)
+        )
+        self.card_chk.pack(anchor="w", padx=8, pady=2)
 
         self.log_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frame_opt, text="Plaka kaydini output/ klasorune .csv yaz",
+        self.log_chk = ttk.Checkbutton(
+            frame_opt, text="Kaydi output/ klasorune .csv yaz",
             variable=self.log_var,
-        ).pack(anchor="w", padx=8, pady=(2, 8))
+        )
+        self.log_chk.pack(anchor="w", padx=8, pady=(2, 8))
+
+        # Modul secimine gore alanlarin aktif/pasif durumunu ayarla.
+        self._on_module_change()
 
         # --- 4) Baslat ---
         self.btn_start = ttk.Button(
@@ -234,10 +268,31 @@ class RoadGuardianUI:
         self._set_selected(dst)
         self.status.config(text=f"Yuklendi: {dst.name}", foreground="#2a7")
 
+    def _on_module_change(self):
+        """Secili modüle göre ilgisiz alanları pasifleştirir."""
+        is_driver = self.module_var.get() == "driver"
+        # Trafik-ozel alanlar surucu modunda kapali.
+        self.country_combo.config(state="disabled" if is_driver else "readonly")
+        self.perf_combo.config(state="disabled" if is_driver else "readonly")
+        self.card_chk.config(state="disabled" if is_driver else "normal")
+        # Webcam alanlari yalnizca surucu modunde aktif.
+        self.webcam_chk.config(state="normal" if is_driver else "disabled")
+        cam_on = is_driver and self.webcam_var.get()
+        self.cam_spin.config(state="normal" if cam_on else "disabled")
+        # Kayit kutusu metni modüle göre.
+        self.log_chk.config(
+            text=("Surucu olay kaydini output/'a .csv yaz" if is_driver
+                  else "Plaka kaydini output/'a .csv yaz")
+        )
+
     # ------------------------------------------------------------------ #
     # Calistirma
     # ------------------------------------------------------------------ #
     def _start(self):
+        if self.module_var.get() == "driver":
+            self._start_driver()
+            return
+
         if self.selected_video is None:
             messagebox.showwarning("Video yok", "Once bir video sec.")
             return
@@ -270,6 +325,39 @@ class RoadGuardianUI:
         if self.log_var.get():
             cmd += ["--log"]
 
+        self._launch(cmd, f"Baslatildi: {self.selected_video.name}")
+
+    def _start_driver(self):
+        """Surucu uyku sensorunu (run_driver.py) baslatir."""
+        use_cam = self.webcam_var.get()
+        cmd = [sys.executable, str(RUN_DRIVER_PY)]
+        label = ""
+        if use_cam:
+            cam_idx = self.cam_index_var.get().strip() or "0"
+            cmd += ["--cam", cam_idx]
+            label = f"Baslatildi: Surucu modulu (webcam #{cam_idx})"
+            stem = "webcam"
+        else:
+            if self.selected_video is None or not self.selected_video.exists():
+                messagebox.showwarning(
+                    "Kaynak yok",
+                    "Webcam kapali; once bir video sec ya da Webcam'i isaretle.",
+                )
+                return
+            cmd += ["--video", str(self.selected_video)]
+            label = f"Baslatildi: Surucu modulu ({self.selected_video.name})"
+            stem = self.selected_video.stem
+
+        if self.save_var.get():
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            cmd += ["--save", str(OUTPUT_DIR / f"{stem}_driver.mp4")]
+        if self.log_var.get():
+            cmd += ["--log"]
+
+        self._launch(cmd, label)
+
+    def _launch(self, cmd, label):
+        """Verilen komutu ayri surecte baslatir ve durumu gunceller."""
         try:
             proc = subprocess.Popen(cmd, cwd=str(ROOT))
         except OSError as exc:
@@ -277,7 +365,7 @@ class RoadGuardianUI:
             return
         self._procs.append(proc)
         self.status.config(
-            text=(f"Baslatildi: {self.selected_video.name}\n"
+            text=(f"{label}\n"
                   "Canli pencere aciliyor (modeller ilk acilista biraz surebilir). "
                   "Cikmak icin pencerede 'q'."),
             foreground="#1a5fb4",
